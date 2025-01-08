@@ -11,7 +11,7 @@ from mmcv.cnn import xavier_init, constant_init
 import mcubes
 import trimesh
 import matplotlib.pyplot as plotlib
-
+import pdb
 
 class DepthRegularizer(nn.Module):
     noise: torch.Tensor
@@ -226,7 +226,7 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             assert self.reduce == 'sum'
             return sum(codes).reshape(code.shape[0] * xyzs.shape[-2], self.in_chs)
 
-    def point_code_render(self, point_code, dirs):
+    def point_code_render(self, point_code, dirs, get_normals=False):
         if self.separate_density_and_color:
             density_code, color_code = torch.chunk(point_code, 2, -1)
             sigmas, _ = self.density_decoder(density_code, None)
@@ -236,7 +236,18 @@ class TensorialDecoder(PointBasedVolumeRenderer):
                 rgbs = None
             return sigmas, rgbs
         else:
-            return self.common_decoder(point_code, dirs)
+            # print(get_normals)
+            if not get_normals:
+                sigmas, rgbs = self.common_decoder(point_code, dirs)
+            else:
+                point_code.requires_grad_(True)
+                sigmas, rgbs = self.common_decoder(point_code, dirs)
+                # normals = torch.autograd.grad(sigmas, point_code, grad_outputs=torch.ones_like(sigmas), create_graph=True, retain_graph=True, only_inputs=True)[0][:,:3].detach()
+                # normals = -F.normalize(normals, p=2, dim=-1)
+                normals = None
+                return sigmas, rgbs, normals
+                
+            return sigmas, rgbs
 
     @torch.no_grad()
     def visualize(self, code, scene_name, viz_dir, code_range=[-1, 1]):
@@ -254,6 +265,7 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             got = got.permute(0, 2, 3, 1).squeeze(0).transpose(-1, -2).flatten(1)  # HWC -> HW'
             got = got.detach().cpu().numpy()
             plotlib.imsave(os.path.join(viz_dir, "features-%s.png" % cfg), got)
+        # pdb.set_trace()
         if not self.visualize_mesh:
             return
         basis = torch.linspace(-1, 1, 500, device=code.device, dtype=code.dtype)
@@ -280,6 +292,8 @@ class TensorialDecoder(PointBasedVolumeRenderer):
             verts, tris = mcubes.marching_cubes(batches.numpy(), 0.0)
         verts = verts / 250 - 1
         # mcubes.smooth()
+        # pdb.set_trace()
+        # pdb.set_trace()
         trimesh.Trimesh(verts, tris).export(os.path.join(viz_dir, str(scene_name[0]) + ".glb"))
 
 

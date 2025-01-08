@@ -22,6 +22,8 @@ from PIL import Image
 import einops
 from opt import config_parser
 from pprint import pprint
+import pdb
+import numpy as np
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -67,12 +69,12 @@ os.makedirs(work_dir, exist_ok=True)
 os.chdir(work_dir)
 
 if not args.load_image:
-    if args.dataset == "nerf_syn":
+    if args.dataset == "nerf_syn": # change to dna rendering
         model_scale = dict(chair=2.1, drums=2.3, ficus=2.3, hotdog=3.0, lego=2.4, materials=2.4, mic=2.5, ship=2.75)
         world_scale = 2 / model_scale[args.obj]
-        dataset = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_train.json"], rgba=True, world_scale=world_scale)
-        val = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_val.json"], world_scale=world_scale)
-        test = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_test.json"], world_scale=world_scale)
+        dataset = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_train.json"], rgba=True, file_id=args.proj_name, world_scale=world_scale, split='train')
+        val = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_val.json"], file_id=args.proj_name, world_scale=world_scale, split='val')
+        test = NerfSynthetic([f"{args.data_dir}/{args.obj}/transforms_test.json"], file_id=args.proj_name, world_scale=world_scale, split='test')
         
         entry = dataset[0]
         selected_idxs = kmeans_downsample(entry['cond_poses'][..., :3, 3], args.n_views)
@@ -91,14 +93,18 @@ if not args.load_image:
             selected_idxs = kmeans_downsample(entry['cond_poses'][..., :3, 3], args.n_views)
     
     data_entry = dict(
+        bg_color=torch.tensor(entry['bg_color']).float().to(device),
         cond_imgs=torch.tensor(entry['cond_imgs'][selected_idxs][None]).float().to(device),
+        cond_imgs_bg=torch.tensor(entry['cond_imgs_bg'][selected_idxs][None]).float().to(device),
         cond_poses=torch.tensor(entry['cond_poses'])[selected_idxs][None].float().to(device),
         cond_intrinsics=torch.tensor(entry['cond_intrinsics'])[selected_idxs][None].float().to(device),
         scene_id=[0],
         scene_name=[args.proj_name]
     )
+    
     entry = val[0]
     val_entry = dict(
+        bg_color=torch.tensor(entry['bg_color']).float().to(device),
         test_imgs=torch.tensor(entry['cond_imgs'][:args.n_val][None]).float().to(device),
         test_poses=torch.tensor(entry['cond_poses'][:args.n_val])[None].float().to(device),
         test_intrinsics=torch.tensor(entry['cond_intrinsics'][:args.n_val])[None].float().to(device),
@@ -237,6 +243,9 @@ prog = tqdm.trange(args.n_iters)
 best_psnr = 0.0
 
 for j in prog:
+    bg_color = np.random.rand(1)
+    # print(bg_color)
+    nerf.bg_color = nerf.decoder.bg_color = torch.nn.Parameter((torch.ones(3).to(device) * torch.from_numpy(bg_color).to(device)).float(), requires_grad=args.learn_bg)
     lv = nerf.train_step(data_entry, optim)['log_vars']
     lr_sched.step()
     lv.pop('code_rms')
@@ -253,6 +262,7 @@ for j in prog:
         cam = OrbitCamera('final', pic_w, pic_h, 3.2, 48)
         cache = nerf.cache[0]
         nerf.eval()
+        nerf.bg_color = nerf.decoder.bg_color = torch.nn.Parameter(torch.ones(3).to(device).float(), requires_grad=args.learn_bg)
         if not args.load_image:
             with torch.no_grad():
                 if os.path.exists("viz"):

@@ -17,7 +17,7 @@ from mmgen.models.architectures.common import get_module_device
 
 from ...core import eval_psnr, eval_ssim_skimage, reduce_mean, rgetattr, rsetattr, extract_geometry, \
     module_requires_grad, get_cam_rays, get_rays, get_ray_directions
-
+import pdb
 LPIPS_BS = 4
 
 
@@ -247,7 +247,7 @@ class BaseNeRF(nn.Module):
             code_scheduler = None
         return code_scheduler
 
-    def ray_sample(self, cond_rays_o, cond_rays_d, cond_imgs, n_samples, cond_times=None, sample_inds=None):
+    def ray_sample(self, cond_rays_o, cond_rays_d, cond_imgs, cond_imgs_bg, n_samples, cond_times=None, sample_inds=None):
         """
         Args:
             cond_rays_o (torch.Tensor): (num_scenes, num_imgs, h, w, 3)
@@ -272,6 +272,7 @@ class BaseNeRF(nn.Module):
                 assert list(cond_times.shape) == [num_scenes, num_imgs]
                 rays_time = cond_times[..., None, None].repeat(1, 1, h, w).reshape(num_scenes, num_scene_pixels, 1)
             target_rgbs = cond_imgs.reshape(num_scenes, num_scene_pixels, cond_imgs.shape[-1])
+            target_rgbs_bg = cond_imgs_bg.reshape(num_scenes, num_scene_pixels, cond_imgs_bg.shape[-1])
         else:
             assert n_samples % (self.patch_size ** 2) == 0
             assert cond_times is None, "dynamic with patch loss is unsupported"
@@ -284,6 +285,9 @@ class BaseNeRF(nn.Module):
             target_rgbs = cond_imgs.reshape(
                 num_scenes, -1, h // self.patch_size, self.patch_size, w // self.patch_size, self.patch_size, cond_imgs.shape[-1]
             ).permute(0, 1, 2, 4, 3, 5, 6).reshape(num_scenes, -1, self.patch_size, self.patch_size, cond_imgs.shape[-1])
+            target_rgbs_bg = cond_imgs.reshape(
+                num_scenes, -1, h // self.patch_size, self.patch_size, w // self.patch_size, self.patch_size, cond_imgs_bg.shape[-1]
+            ).permute(0, 1, 2, 4, 3, 5, 6).reshape(num_scenes, -1, self.patch_size, self.patch_size, cond_imgs_bg.shape[-1])
         if num_scene_pixels > n_samples:
             if sample_inds is None:
                 sample_inds = [
@@ -296,13 +300,15 @@ class BaseNeRF(nn.Module):
             rays_o = rays_o[scene_arange, sample_inds]
             rays_d = rays_d[scene_arange, sample_inds]
             target_rgbs = target_rgbs[scene_arange, sample_inds]
+            target_rgbs_bg = target_rgbs_bg[scene_arange, sample_inds]
             if rays_time is not None:
                 rays_time = rays_time[scene_arange, sample_inds]
         if self.patch_loss is not None or self.patch_reg_loss is not None:
             rays_o = rays_o.reshape(num_scenes, -1, 3)
             rays_d = rays_d.reshape(num_scenes, -1, 3)
             target_rgbs = target_rgbs.reshape(-1, self.patch_size, self.patch_size, cond_imgs.shape[-1])
-        return rays_o, rays_d, target_rgbs, sample_inds, rays_time
+            target_rgbs_bg = target_rgbs_bg.reshape(-1, self.patch_size, self.patch_size, cond_imgs.shape[-1])
+        return rays_o, rays_d, target_rgbs, target_rgbs_bg, sample_inds, rays_time
 
     def get_raybatch_inds(self, cond_imgs, n_inverse_rays):
         device = cond_imgs.device
@@ -323,17 +329,23 @@ class BaseNeRF(nn.Module):
             raybatch_inds = num_raybatch = None
         return raybatch_inds, num_raybatch
 
-    def loss(self, decoder, code, density_bitfield, target_rgbs, sample_inds,
+    def loss(self, decoder, code, density_bitfield, target_rgbs, target_rgbs_bg, sample_inds,
              rays_o, rays_d, dt_gamma=0.0, return_decoder_loss=False, scale_num_ray=1.0,
              rays_time=None, cfg=dict(), **kwargs):
         outputs = decoder(
             rays_o, rays_d, code, density_bitfield, self.grid_size, sample_inds=sample_inds, rays_time=rays_time,
             dt_gamma=dt_gamma, perturb=True, return_loss=return_decoder_loss, **kwargs)
         out_weights = outputs['weights_sum']
+        # if self.training:
+        #     out_rgbs = outputs['image'] + target_rgbs_bg * (1 - out_weights.unsqueeze(-1))
+        # else:
         out_rgbs = outputs['image'] + outputs.get('bg', self.bg_color) * (1 - out_weights.unsqueeze(-1))
         scale = 1 - math.exp(-cfg['loss_coef'] * scale_num_ray) if 'loss_coef' in cfg else 1
         if target_rgbs.shape[-1] == 4:
-            target_rgbs[..., :3] = target_rgbs[..., :3] * target_rgbs[..., 3:] + (1 - target_rgbs[..., 3:])
+            # if self.training:
+            #     pass
+            # else:
+            target_rgbs[..., :3] = target_rgbs[..., :3] * target_rgbs[..., 3:] + self.bg_color * (1 - target_rgbs[..., 3:])
             out_rgbs = torch.cat([out_rgbs, out_weights.unsqueeze(-1)], dim=-1)
         pixel_loss = self.pixel_loss(
             out_rgbs, target_rgbs.reshape(out_rgbs.size())) * (scale * 3)
@@ -366,14 +378,14 @@ class BaseNeRF(nn.Module):
         return (out_rgbs, target_rgbs), loss, loss_dict
 
     def loss_decoder(self, decoder, code, density_bitfield, cond_rays_o, cond_rays_d,
-                     cond_imgs, cond_times=None, dt_gamma=0.0, cfg=dict(), **kwargs):
+                     cond_imgs, cond_imgs_bg, cond_times=None, dt_gamma=0.0, cfg=dict(), **kwargs):
         decoder_training_prev = decoder.training
         decoder.train(True)
         n_decoder_rays = cfg.get('n_decoder_rays', 4096)
-        rays_o, rays_d, target_rgbs, sample_inds, rays_time = self.ray_sample(
-            cond_rays_o, cond_rays_d, cond_imgs, cond_times=cond_times, n_samples=n_decoder_rays)
+        rays_o, rays_d, target_rgbs, target_rgbs_bg, sample_inds, rays_time = self.ray_sample(
+            cond_rays_o, cond_rays_d, cond_imgs, cond_imgs_bg, cond_times=cond_times, n_samples=n_decoder_rays)
         (out_rgbs, target_rgbs), loss, loss_dict = self.loss(
-            decoder, code, density_bitfield, target_rgbs, sample_inds,
+            decoder, code, density_bitfield, target_rgbs, target_rgbs_bg, sample_inds,
             rays_o, rays_d, dt_gamma, return_decoder_loss=True, scale_num_ray=cond_rays_o.shape[1:4].numel(),
             rays_time=rays_time,
             cfg=cfg, **kwargs)
@@ -532,6 +544,7 @@ class BaseNeRF(nn.Module):
                 rays_time = [rays_time]
 
         out_image = []
+        out_normal = []
         out_depth = []
         if rays_time is None:
             rays_time = len(rays_o) * [None]
@@ -547,6 +560,9 @@ class BaseNeRF(nn.Module):
                 rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0]) \
                     + outputs.get('bg', self.bg_color) * (1 - weights_sum.unsqueeze(-1))
                 out_image.append(rgbs)
+                # normals = ((torch.stack(outputs['normal'], dim=0) if num_scenes > 1 else outputs['normal'][0]) + 1) / 2 \
+                #     + outputs.get('bg', self.bg_color) * (1 - weights_sum.unsqueeze(-1))
+                # out_normal.append(normals)
             else:
                 rgbs = (torch.stack(outputs['image'], dim=0) if num_scenes > 1 else outputs['image'][0])
                 rgbas = torch.cat([rgbs, weights_sum.unsqueeze(-1)], dim=-1)
@@ -555,22 +571,24 @@ class BaseNeRF(nn.Module):
             out_depth.append(depth)
         out_image = torch.cat(out_image, dim=-2) if len(out_image) > 1 else out_image[0]
         out_image = out_image.reshape(num_scenes, num_imgs, h, w, 4 if return_rgba else 3)
+        # out_normal = torch.cat(out_normal, dim=-2) if len(out_normal) > 1 else out_normal[0]
+        # out_normal = out_normal.reshape(num_scenes, num_imgs, h, w, 3)
         out_depth = torch.cat(out_depth, dim=-1) if len(out_depth) > 1 else out_depth[0]
         out_depth = out_depth.reshape(num_scenes, num_imgs, h, w)
-
+        
         if cfg.get('inverse_z_depth', True):
             out_depth = out_depth * torch.linalg.norm(directions, dim=-1)
 
         decoder.train(decoder_training_prev)
-        return out_image, out_depth
+        return out_image, out_normal, out_depth
 
-    def eval_and_viz(self, data, decoder, code, density_bitfield, viz_dir=None, cfg=dict()):
+    def eval_and_viz(self, data, decoder, code, density_bitfield, viz_dir=None, cfg=dict(), save=True):
         scene_name = data['scene_name']  # (num_scenes,)
         test_intrinsics = data['test_intrinsics']  # (num_scenes, num_imgs, 4), in [fx, fy, cx, cy]
         test_poses = data['test_poses']
         test_times = data.get('test_times', None)
         num_scenes, num_imgs, _, _ = test_poses.size()
-
+        
         if 'test_imgs' in data and not cfg.get('skip_eval', False):
             test_imgs = data['test_imgs']  # (num_scenes, num_imgs, h, w, 3)
             _, _, h, w, _ = test_imgs.size()
@@ -579,79 +597,84 @@ class BaseNeRF(nn.Module):
         else:
             test_imgs = test_img_paths = target_imgs = None
             h, w = cfg['img_size']
-        image, depth = self.render(
-            decoder, code, density_bitfield, h, w, test_intrinsics, test_poses, times=test_times, cfg=cfg)
+        image, normal, depth = self.render(decoder, code, density_bitfield, h, w, test_intrinsics, test_poses, times=test_times, cfg=cfg)
+        
+        code_range = cfg.get('clip_range', [-1, 1])
         pred_imgs = image.permute(0, 1, 4, 2, 3).reshape(
             num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
         pred_imgs = torch.round(pred_imgs * 255) / 255
-
-        if test_imgs is not None:
-            test_psnr = eval_psnr(pred_imgs, target_imgs)
-            test_ssim = eval_ssim_skimage(pred_imgs, target_imgs, data_range=1)
-            log_vars = dict(test_psnr=float(test_psnr.mean()),
-                            test_ssim=float(test_ssim.mean()))
-            if self.lpips is not None:
-                if len(self.lpips) == 0:
-                    lpips_eval = lpips.LPIPS(
-                        net='vgg', eval_mode=True, pnet_tune=False).to(
-                        device=pred_imgs.device, dtype=torch.bfloat16)
-                    self.lpips.append(lpips_eval)
-                test_lpips = []
-                for pred_imgs_batch, target_imgs_batch in zip(
-                        pred_imgs.split(LPIPS_BS, dim=0), target_imgs.split(LPIPS_BS, dim=0)):
-                    test_lpips.append(self.lpips[0](
-                        (pred_imgs_batch * 2 - 1).to(torch.bfloat16),
-                        (target_imgs_batch * 2 - 1).to(torch.bfloat16)).flatten())
-                test_lpips = torch.cat(test_lpips, dim=0)
-                log_vars.update(test_lpips=float(test_lpips.mean()))
-            else:
-                test_lpips = [math.nan for _ in range(num_scenes * num_imgs)]
-        else:
-            log_vars = dict()
-
-        if viz_dir is None:
-            viz_dir = cfg.get('viz_dir', None)
-        if viz_dir is not None:
-            os.makedirs(viz_dir, exist_ok=True)
-            output_viz = torch.round(pred_imgs.permute(0, 2, 3, 1) * 255).to(
-                torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
+        # pred_normals = normal.permute(0, 1, 4, 2, 3).reshape(
+        #     num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
+        # pred_normals = torch.round(pred_normals * 255) / 255
+        # pdb.set_trace()
+        log_vars = None
+        if save and not os.path.isfile(os.path.join(viz_dir, scene_name[0] + '.glb')):
             if test_imgs is not None:
-                real_imgs_viz = (target_imgs.permute(0, 2, 3, 1) * 255).to(
+                test_psnr = eval_psnr(pred_imgs, target_imgs)
+                test_ssim = eval_ssim_skimage(pred_imgs, target_imgs, data_range=1)
+                log_vars = dict(test_psnr=float(test_psnr.mean()),
+                                test_ssim=float(test_ssim.mean()))
+                if self.lpips is not None:
+                    if len(self.lpips) == 0:
+                        lpips_eval = lpips.LPIPS(
+                            net='vgg', eval_mode=True, pnet_tune=False).to(
+                            device=pred_imgs.device, dtype=torch.bfloat16)
+                        self.lpips.append(lpips_eval)
+                    test_lpips = []
+                    for pred_imgs_batch, target_imgs_batch in zip(
+                            pred_imgs.split(LPIPS_BS, dim=0), target_imgs.split(LPIPS_BS, dim=0)):
+                        test_lpips.append(self.lpips[0](
+                            (pred_imgs_batch * 2 - 1).to(torch.bfloat16),
+                            (target_imgs_batch * 2 - 1).to(torch.bfloat16)).flatten())
+                    test_lpips = torch.cat(test_lpips, dim=0)
+                    log_vars.update(test_lpips=float(test_lpips.mean()))
+                else:
+                    test_lpips = [math.nan for _ in range(num_scenes * num_imgs)]
+            else:
+                log_vars = dict()
+
+            if viz_dir is None:
+                viz_dir = cfg.get('viz_dir', None)
+            if viz_dir is not None:
+                os.makedirs(viz_dir, exist_ok=True)
+                output_viz = torch.round(pred_imgs.permute(0, 2, 3, 1) * 255).to(
                     torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
-                output_viz = np.concatenate([real_imgs_viz, output_viz], axis=-2)
-            for scene_id, scene_name_single in enumerate(scene_name):
-                for img_id in range(num_imgs):
-                    if test_img_paths is not None:
-                        base_name = 'scene_' + scene_name_single + '_' + os.path.splitext(
-                            os.path.basename(test_img_paths[scene_id][img_id]))[0]
-                        name = base_name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
-                            test_psnr[scene_id * num_imgs + img_id],
-                            test_ssim[scene_id * num_imgs + img_id],
-                            test_lpips[scene_id * num_imgs + img_id])
-                        existing_files = glob(os.path.join(viz_dir, base_name + '*.png'))
-                        for file in existing_files:
-                            os.remove(file)
-                    else:
-                        name = 'scene_' + scene_name_single + '_{:03d}.png'.format(img_id)
-                        if test_imgs is not None:
-                            name = name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
+                if test_imgs is not None:
+                    real_imgs_viz = (target_imgs.permute(0, 2, 3, 1) * 255).to(
+                        torch.uint8).cpu().numpy().reshape(num_scenes, num_imgs, h, w, 3)
+                    output_viz = np.concatenate([real_imgs_viz, output_viz], axis=-2)
+                for scene_id, scene_name_single in enumerate(scene_name):
+                    for img_id in range(num_imgs):
+                        if test_img_paths is not None:
+                            base_name = 'scene_' + scene_name_single + '_' + os.path.splitext(
+                                os.path.basename(test_img_paths[scene_id][img_id]))[0]
+                            name = base_name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
                                 test_psnr[scene_id * num_imgs + img_id],
                                 test_ssim[scene_id * num_imgs + img_id],
                                 test_lpips[scene_id * num_imgs + img_id])
-                    plt.imsave(
-                        os.path.join(viz_dir, name),
-                        output_viz[scene_id][img_id])
-                    plt.imsave(
-                        os.path.join(viz_dir, "depth_" + name),
-                        depth[scene_id][img_id].cpu().numpy())
-            if isinstance(decoder, DistributedDataParallel):
-                decoder = decoder.module
-            code_range = cfg.get('clip_range', [-1, 1])
-            decoder.visualize(code, scene_name, viz_dir, code_range=code_range)
-            if self.init_code is not None:
-                decoder.visualize(self.init_code[None], ['000_mean'], viz_dir, code_range=code_range)
+                            existing_files = glob(os.path.join(viz_dir, base_name + '*.png'))
+                            for file in existing_files:
+                                os.remove(file)
+                        else:
+                            name = 'scene_' + scene_name_single + '_{:03d}.png'.format(img_id)
+                            if test_imgs is not None:
+                                name = name + '_psnr{:02.1f}_ssim{:.2f}_lpips{:.3f}.png'.format(
+                                    test_psnr[scene_id * num_imgs + img_id],
+                                    test_ssim[scene_id * num_imgs + img_id],
+                                    test_lpips[scene_id * num_imgs + img_id])
+                        plt.imsave(
+                            os.path.join(viz_dir, name),
+                            output_viz[scene_id][img_id])
+                        plt.imsave(
+                            os.path.join(viz_dir, "depth_" + name),
+                            depth[scene_id][img_id].cpu().numpy())
+                if isinstance(decoder, DistributedDataParallel):
+                    decoder = decoder.module
+                decoder.visualize(code, scene_name, viz_dir, code_range=code_range)
+                if self.init_code is not None:
+                    decoder.visualize(self.init_code[None], ['000_mean'], viz_dir, code_range=code_range)
 
-        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, 3, h, w)
+        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, 3, h, w), None
 
     def mean_ema_update(self, code):
         if self.init_code is None:

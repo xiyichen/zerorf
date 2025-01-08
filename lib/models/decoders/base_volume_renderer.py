@@ -4,6 +4,7 @@ import torch.nn as nn
 from mmgen.models.builder import build_module
 from mmgen.models.architectures.common import get_module_device
 from mmcv.cnn import xavier_init, constant_init
+import pdb
 
 from ...core import custom_meshgrid
 from lib.ops import SHEncoder, TruncExp
@@ -12,7 +13,7 @@ from lib.ops import (
     march_rays_train, batch_composite_rays_train, march_rays, composite_rays,
     morton3D, morton3D_invert, packbits)
 from ..decoders.samplers import sample_ray_unbounded
-
+import torch.nn.functional as F
 
 class VolumeRenderer(nn.Module):
     def __init__(self,
@@ -222,6 +223,7 @@ class VolumeRenderer(nn.Module):
 
         nears, fars = batch_near_far_from_aabb(rays_o, rays_d, self.aabb.to(rays_o), self.min_near)
         dtype = torch.float32
+        normal = None
 
         if self.unbounded:
             assert self.occlusion_culling_th > 0
@@ -313,6 +315,7 @@ class VolumeRenderer(nn.Module):
             weights_sum = []
             depth = []
             image = []
+            normal = []
 
             if rays_time is None:
                 rays_time = [None] * num_scenes
@@ -324,8 +327,11 @@ class VolumeRenderer(nn.Module):
                 num_rays_per_scene = rays_o_single.size(0)
 
                 weights_sum_single = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
+                weights_sum_single_ = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
                 depth_single = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
+                depth_single_ = torch.zeros(num_rays_per_scene, dtype=dtype, device=device)
                 image_single = torch.zeros(num_rays_per_scene, 3, dtype=dtype, device=device)
+                normal_map_single = torch.zeros(num_rays_per_scene, 3, dtype=dtype, device=device)
 
                 num_rays_alive = num_rays_per_scene
                 rays_alive = torch.arange(num_rays_alive, dtype=torch.int32, device=device)  # (num_rays_alive,)
@@ -347,12 +353,13 @@ class VolumeRenderer(nn.Module):
                     if rays_time_single is not None:
                         times = rays_time_single.repeat(1, n_step).reshape(-1, 1)
                         xyzs = torch.cat([xyzs, times], dim=-1)
-                    sigmas, rgbs, _ = self.point_decode([xyzs], [dirs], code_single[None])
+                    sigmas, rgbs, _ = self.point_decode([xyzs], [dirs], code_single[None], get_normals=False)
                     if self.pre_gamma is not None:
                         rgbs = rgbs ** self.pre_gamma
-                    composite_rays(
-                        num_rays_alive, n_step, rays_alive, rays_t, sigmas.to(dtype), rgbs.to(dtype), ts,
-                        weights_sum_single, depth_single, image_single)
+                    # composite_rays(num_rays_alive, n_step, rays_alive.clone(), rays_t.clone(), sigmas.to(dtype).clone(), normals.to(dtype), ts.clone(), weights_sum_single_, depth_single_, normal_map_single)
+                    composite_rays(num_rays_alive, n_step, rays_alive, rays_t, sigmas.to(dtype), rgbs.to(dtype), ts, weights_sum_single, depth_single, image_single)
+                    normal_map_single = F.normalize(normal_map_single, p=2, dim=-1)
+                    # pdb.set_trace()
                     if rays_time_single is not None:
                         rays_time_single = rays_time_single[rays_alive >= 0]
                     rays_alive = rays_alive[rays_alive >= 0]
@@ -362,12 +369,14 @@ class VolumeRenderer(nn.Module):
                 weights_sum.append(weights_sum_single)
                 depth.append(depth_single)
                 image.append(image_single)
+                # normal.append(normal_map_single)
 
         results = dict(
             weights=weights,
             weights_sum=weights_sum,
             depth=depth,
             image=image,
+            # normal=normal,
             sample_inds=sample_inds
         )
 
@@ -386,7 +395,7 @@ class PointBasedVolumeRenderer(VolumeRenderer):
     def point_code_render(self, point_code, dirs):
         raise NotImplementedError
 
-    def point_decode(self, xyzs, dirs, code, density_only=False):
+    def point_decode(self, xyzs, dirs, code, density_only=False, get_normals=False):
         """
         Args:
             xyzs: Shape (num_scenes, (num_points_per_scene, 3))
@@ -408,8 +417,33 @@ class PointBasedVolumeRenderer(VolumeRenderer):
                 num_points.append(num_points_per_scene)
                 point_code.append(point_code_single)
             point_code = torch.cat(point_code, dim=0) if len(point_code) > 1 else point_code[0]
-        sigmas, rgbs = self.point_code_render(point_code, dirs)
-        return sigmas, rgbs, num_points
+        if not get_normals:
+            sigmas, rgbs = self.point_code_render(point_code, dirs, get_normals)
+            return sigmas, rgbs, num_points
+        else:
+            with torch.no_grad():
+                sigmas, rgbs, _ = self.point_code_render(point_code, dirs, get_normals)
+                
+                eps = 0.001
+                xyz = torch.stack(xyzs).reshape(-1,3)
+                points_d = torch.stack([xyz + torch.as_tensor([eps, 0.0, 0.0]).to(xyz.device),xyz + torch.as_tensor([-eps, 0.0, 0.0]).to(xyz.device),xyz + torch.as_tensor([0.0, eps, 0.0]).to(xyz.device),xyz + torch.as_tensor([0.0, -eps, 0.0]).to(xyz.device),xyz + torch.as_tensor([0.0, 0.0, eps]).to(xyz.device),xyz + torch.as_tensor([0.0, 0.0, -eps]).to(xyz.device)], dim=0).clamp(0, 1)
+                
+                num_points = []
+                point_code = []
+                for i, xyzs_single in enumerate(points_d):
+                    num_points_per_scene = xyzs_single.size(-2)
+                    point_code_single = self.get_point_code(code[0: 1], xyzs_single[None])
+                    num_points.append(num_points_per_scene)
+                    point_code.append(point_code_single)
+                point_code = torch.cat(point_code, dim=0) if len(point_code) > 1 else point_code[0]
+                dirs_all = []
+                for i in range(6): dirs_all.append(dirs[0])
+                dirs_all = torch.stack(dirs_all).reshape(-1, 3)
+                sigmas_diff, _, _ = self.point_code_render(point_code, [dirs_all], get_normals)
+                sigmas_diff = sigmas_diff.reshape(6, -1)
+                normals = torch.stack([0.5 * (sigmas_diff[0] - sigmas_diff[1]) / eps, 0.5 * (sigmas_diff[2] - sigmas_diff[3]) / eps, 0.5 * (sigmas_diff[4] - sigmas_diff[5]) / eps], dim=-1)
+                normals = -F.normalize(normals, p=2, dim=-1)
+                return sigmas, rgbs, normals, num_points
 
     def point_density_decode(self, xyzs, code, **kwargs):
         sigmas, _, num_points = self.point_decode(
@@ -449,7 +483,8 @@ class PointBasedDecoder(PointBasedVolumeRenderer):
         if self.dir_net is not None:
             constant_init(self.dir_net, 0)
 
-    def point_code_render(self, point_code, dirs):
+    def point_code_render(self, point_code, dirs, get_normals=False):
+        pdb.set_trace()
         base_x = self.base_net(point_code)
         base_x_act = self.base_activation(base_x)
         sigmas = self.density_net(base_x_act).squeeze(-1)

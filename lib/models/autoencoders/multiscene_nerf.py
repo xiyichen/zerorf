@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import tqdm
 import mmcv
+import pdb
 
 from mmcv.runner import get_dist_info
 from mmgen.models.builder import MODELS
@@ -132,7 +133,6 @@ class MultiSceneNeRF(BaseNeRF):
                     else self.get_init_density_bitfield(None, device))
         density_grid = torch.stack(density_grid, dim=0)
         density_bitfield = torch.stack(density_bitfield, dim=0)
-
         code_optimizers = self.build_optimizer(code_list_, self.train_cfg)
         for ind, scene_state_single in enumerate(cache_list):
             if scene_state_single is not None and 'optimizer' in scene_state_single:
@@ -198,6 +198,7 @@ class MultiSceneNeRF(BaseNeRF):
 
         # ==== optimize code ====
         cond_imgs = data['cond_imgs']  # (num_scenes, num_imgs, h, w, 3)
+        cond_imgs_bg = data['cond_imgs_bg']  # (num_scenes, num_imgs, h, w, 3)
         cond_intrinsics = data['cond_intrinsics']  # (num_scenes, num_imgs, 4), in [fx, fy, cx, cy]
         cond_poses = data['cond_poses']
         cond_times = data.get('cond_times')
@@ -229,7 +230,7 @@ class MultiSceneNeRF(BaseNeRF):
 
         loss, log_vars, out_rgbs, target_rgbs = self.loss_decoder(
             self.decoder, code, density_bitfield, cond_rays_o, cond_rays_d,
-            cond_imgs, dt_gamma=dt_gamma, cond_times=cond_times, cfg=self.train_cfg,
+            cond_imgs, cond_imgs_bg, dt_gamma=dt_gamma, cond_times=cond_times, cfg=self.train_cfg,
             update_extra_state=self.update_extra_iters,
             extra_args=(density_grid, density_bitfield, 0),
             extra_kwargs=dict(

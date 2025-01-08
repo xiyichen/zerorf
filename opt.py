@@ -18,7 +18,7 @@ def config_parser(cmd=None):
     parser.add_argument("--obj", type=str, 
                         default="chair", help='object name')
     parser.add_argument("--n-views", type=int, 
-                        default=6, help='number of input views')
+                        default=4, help='number of input views')
     
     # model
     parser.add_argument("--model-res", type=int, 
