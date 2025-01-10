@@ -23,3 +23,5 @@ build/
 debug*
 mmgeneration/
 *dna_rendering*
+slurm*
+rm*

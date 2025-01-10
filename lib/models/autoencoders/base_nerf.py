@@ -603,6 +603,8 @@ class BaseNeRF(nn.Module):
         pred_imgs = image.permute(0, 1, 4, 2, 3).reshape(
             num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
         pred_imgs = torch.round(pred_imgs * 255) / 255
+        pred_depths = torch.round(depth * 255) / 255
+        
         # pred_normals = normal.permute(0, 1, 4, 2, 3).reshape(
         #     num_scenes * num_imgs, 3, h, w).clamp(min=0, max=1)
         # pred_normals = torch.round(pred_normals * 255) / 255
@@ -674,7 +676,7 @@ class BaseNeRF(nn.Module):
                 if self.init_code is not None:
                     decoder.visualize(self.init_code[None], ['000_mean'], viz_dir, code_range=code_range)
 
-        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, 3, h, w), None
+        return log_vars, pred_imgs.reshape(num_scenes, num_imgs, 3, h, w), pred_depths.reshape(num_scenes, num_imgs, h, w)
 
     def mean_ema_update(self, code):
         if self.init_code is None:

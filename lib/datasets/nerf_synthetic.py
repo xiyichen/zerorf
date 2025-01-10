@@ -808,7 +808,7 @@ class NerfSynthetic(Dataset):
             pose = Rot@pose
             # c2w
             frames_p.append((numpy.array(pose)) * world_scale)
-            frames_c.append(numpy.array([cameras['K'][cam_idx][0][0]//2, cameras['K'][cam_idx][1][1]//2, cameras['K'][cam_idx][0][2]//2, cameras['K'][cam_idx][1][2]//2]).astype(np.float32) * 1.0)
+            frames_c.append(numpy.array([cameras['K'][cam_idx][0][0]/2, cameras['K'][cam_idx][1][1]/2, cameras['K'][cam_idx][0][2]/2, cameras['K'][cam_idx][1][2]/2]).astype(np.float32) * 1.0)
         
         f32 = numpy.float32
         return dict(

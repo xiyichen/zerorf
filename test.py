@@ -129,7 +129,7 @@ code_list_, code_optimizers, density_grid, density_bitfield = nerf.load_cache(da
 nerf.save_cache(code_list_, code_optimizers, density_grid, density_bitfield, [0], [0])
 
 torch.set_grad_enabled(False)
-nerf.load_state_dict(torch.load(f"/fs/gamma-projects/3dnvs_gamma/zerorf/results/{args.proj_name}/nerf-zerorf.pt"))
+nerf.load_state_dict(torch.load(f"/fs/gamma-projects/3dnvs_gamma/zerorf/results_p2/{args.proj_name}/nerf-zerorf.pt"))
 for i in range(100):
     nerf.decoder.update_extra_state(code_list_[0][None], density_grid, density_bitfield, 1, density_thresh=0.01, decay=0.9, S=64)
 cache = nerf.cache[0]
@@ -137,7 +137,7 @@ _ = nerf.eval_and_viz(
     test_entry, nerf.decoder,
     cache['param']['code_'][None].to(device),
     density_bitfield,
-    "viz/test_viz",
+    "viz_p2/test_viz",
     cfg=nerf.test_cfg,
     save=True
 )

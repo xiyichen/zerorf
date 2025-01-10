@@ -64,7 +64,7 @@ if args.load_image:
     focal_length = y / numpy.tan(meta['fovy'] / 2)
     intrinsics = numpy.array([[focal_length, focal_length, x, y]] * args.n_views)
 
-work_dir = "results/%s" % args.proj_name
+work_dir = "results_dna_rendering/%s" % args.proj_name
 os.makedirs(work_dir, exist_ok=True)
 os.chdir(work_dir)
 
@@ -267,7 +267,7 @@ for j in prog:
             with torch.no_grad():
                 if os.path.exists("viz"):
                     shutil.rmtree("viz")
-                log_vars, _ = nerf.eval_and_viz(
+                log_vars, _, _ = nerf.eval_and_viz(
                     val_entry, nerf.decoder,
                     cache['param']['code_'][None].to(device),
                     cache['param']['density_bitfield'][None].to(device),
@@ -312,7 +312,7 @@ for j in prog:
                         cv2.COLOR_RGB2BGR
                     ))
                 if j == len(prog) - 1:
-                    log_vars, _ = nerf.eval_and_viz(
+                    log_vars, _, _ = nerf.eval_and_viz(
                         dict(
                             test_poses=data_entry['cond_poses'],
                             test_intrinsics=data_entry['cond_intrinsics'],
@@ -327,7 +327,7 @@ for j in prog:
                     )
                     wandb.log(dict(train_final=log_vars))
                     if not args.load_image:
-                        log_vars, _ = nerf.eval_and_viz(
+                        log_vars, _, _ = nerf.eval_and_viz(
                             test_entry, nerf.decoder,
                             cache['param']['code_'][None].to(device),
                             cache['param']['density_bitfield'][None].to(device),
